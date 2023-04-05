@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"html/template"
 	"log"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -77,6 +79,7 @@ func (c *Config) Client() (*CombinedConfig, error) {
 	retryableClient.RetryMax = c.HTTPRetryMax
 	retryableClient.RetryWaitMin = time.Duration(c.HTTPRetryWaitMin * float64(time.Second))
 	retryableClient.RetryWaitMax = time.Duration(c.HTTPRetryWaitMax * float64(time.Second))
+	retryableClient.Backoff = digitalOceanAPIBackoff
 
 	client := retryableClient.StandardClient()
 	client.Transport = &oauth2.Transport{
@@ -110,4 +113,33 @@ func (c *Config) Client() (*CombinedConfig, error) {
 		accessID:               c.AccessID,
 		secretKey:              c.SecretKey,
 	}, nil
+}
+
+func digitalOceanAPIBackoff(min, max time.Duration, attemptNum int, resp *http.Response) time.Duration {
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+		// Retrieve API's Rate Limit Reset unix timestamp
+		if s, ok := resp.Header["Ratelimit-Reset"]; ok {
+			if resetUnix, err := strconv.ParseInt(s[0], 10, 64); err == nil {
+				nowUnix := time.Now().Unix()
+				sleep := time.Second * time.Duration(resetUnix-nowUnix)
+
+				log.Printf("[INFO] Reached API Rate Limit, waiting: %s seconds", sleep)
+
+				// Cap sleep time to maximum configured value (to prevent too long wait times for mismatched clocks)
+				if sleep > max {
+					return max
+				}
+
+				// Avoid negative sleep times (generally indicates a mismatched clock)
+				if sleep > 0 {
+					return sleep
+				}
+			}
+		}
+	}
+
+	// Fallback to default backoff strategy
+	sleep := retryablehttp.DefaultBackoff(min, max, attemptNum, resp)
+	log.Printf("[INFO] API Error (not Rate Limit), waiting: %s seconds", sleep)
+	return sleep
 }
